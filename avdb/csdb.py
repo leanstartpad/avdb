@@ -21,16 +21,24 @@
 
 """AFS CellServDB parser"""
 
+import sys
 import re
-import urllib2
+import dns.resolver
 from collections import OrderedDict
 from pprint import pformat
+
+try:
+    from urllib.request import urlopen # python3
+except ImportError:
+    from urllib2 import urlopen # python2
 
 def readfile(path):
     """Read a CellServDB file from a url or local path."""
     if path.startswith('https://') or path.startswith('http://'):
-        response = urllib2.urlopen(path)
+        response = urlopen(path)
         text = response.read()
+    elif path == '-':
+        text = sys.stdin.read()
     else:
         if path.startswith('file://'):
             path = path.replace('file://', '')
@@ -74,3 +82,54 @@ def parse(text):
         cells[name] = {'desc':desc, 'hosts':hosts}
     return cells
 
+def lookup(name):
+    """Query DNS for cell hosts.
+
+    Returns addresses for both AFSDB and SRV records.
+    """
+    hostnames = set()
+    try:
+        answers = dns.resolver.query(name, 'AFSDB')
+        for rdata in answers:
+            hostname = rdata.get_hostname().to_text().strip('.')
+            hostnames.add(hostname)
+    except dns.resolver.NoAnswer:
+        pass
+    except dns.resolver.NXDOMAIN:
+        pass
+
+    services = (
+        'afs3-vlserver', # servers providing AFS VLDB services.
+        'afs3-prserver', # servers providing AFS PTS services.
+    )
+    proto = 'udp'
+    for service in services:
+        # The label of a DNS SRV record, as defined in RFC 5864.
+        label = '_{service}._{proto}.{name}' \
+                .format(service=service, proto=proto, name=name)
+        try:
+            answers = dns.resolver.query(label, 'SRV')
+            for rdata in answers:
+                hostname = rdata.target.to_text().strip('.')
+                hostnames.add(hostname)
+        except dns.resolver.NoAnswer:
+            pass
+        except dns.resolver.NXDOMAIN:
+            pass
+
+    results = []
+    for hostname in hostnames:
+        addrs = []
+        try:
+            answers = dns.resolver.query(hostname, 'A')
+            for rdata in answers:
+                addr = rdata.to_text().encode('utf-8') # unicode to str
+                addrs.append(addr)
+        except dns.resolver.NoAnswer:
+            pass
+        except dns.resolver.NXDOMAIN:
+            pass
+        if addrs:
+            results.append((addrs[0], hostname))
+
+    return results

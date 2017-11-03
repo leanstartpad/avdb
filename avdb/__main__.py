@@ -20,15 +20,17 @@
 
 """AFS version database cli"""
 
-import sys, logging, mpipe, sh
-from avdb.subcmd import subcommand, argument, usage, dispatch
-from avdb.model import init_db, Session, Cell, Host, Node, Version
-from avdb.csdb import readfile, parse
+from __future__ import print_function
+import os, sys, datetime, re, logging, mpipe, sh, pystache, avdb
+from avdb.subcmd import subcommand, argument, usage, dispatch, config
+from avdb.model import mysql_create_db, init_db, Session, Cell, Host, Node, Version
+from avdb.csdb import readfile, parse, lookup
+from avdb.templates import template
 
 log = logging.getLogger('avdb')
 
 @subcommand()
-def help(args):
+def help_(**kwargs):
     """Display help message"""
     usage("""avdb [command] [options]
 
@@ -38,31 +40,84 @@ and generate reports.
     return 0
 
 @subcommand()
-def version(args):
+def version_(**kwargs):
     """Print the version number and exit"""
-    from avdb import __version__
-    print __version__
-    return 0
-
-@subcommand()
-def init(args):
-    """Create database tables"""
-    init_db()
+    print(avdb.__version__)
     return 0
 
 @subcommand(
-    argument('csdb', nargs='+', help="url or path to CellServDB file"))
-def import__(args): # Trailing underscores to avoid reserved name 'import'.
+    argument('--admin', default='root', help="database admin username"),
+    argument('--password', help="database admin password"),
+)
+def init_(url=None, admin='root', password=None, **kwargs):
+    """Create database tables"""
+    if url is None:
+        return 1
+    # Create the database and tables.
+    if url.startswith('sqlite://'):
+        pass
+    elif url.startswith('mysql://'):
+        if password is None:
+            log.error("mysql admin password is required to create database")
+            return 2
+        m = re.match(r'mysql://([^:]*):([^@]*)@([^/]*)/(.*)', url)
+        if m is None:
+            log.error("Unable to parse url '%s'", url)
+            return 3
+        dbuser,dbpasswd,dbhost,dbname = m.groups()
+        log.info("Creating mysql database '%s' and user '%s'", dbname, dbuser)
+        mysql_create_db(admin, password, dbuser, dbpasswd, dbhost, dbname)
+    else:
+        log.error("Unsupported db type in url '%s'", url)
+        return 4
+    log.info("Creating database tables")
+    init_db(url)
+    # Save our url in the ini file, if not already there.
+    if not config.has_option('global', 'url') or config.get('global', 'url') != url:
+        if not config.has_section('global'):
+            config.add_section('global')
+        config.set('global', 'url', url)
+        inifile = os.path.expanduser('~/.avdb.ini')
+        log.info("Saving database connection url in file '%s'", inifile)
+        with open(inifile, 'w') as f:
+            config.write(f)
+    return 0
+
+@subcommand(
+    argument('--csdb', nargs='+', help="url or path to CellServDB file"),
+    argument('--name', nargs='+', help="cellname for dns lookup"))
+def import_(csdb=None, name=None, url=None, **kwargs):
     """Import cells from CellServDB files"""
-    init_db()
+    if csdb is None:
+        csdb = ()
+    elif type(csdb) is not list and type(csdb) is not tuple:
+        csdb = (csdb,)
+    if name is None:
+        name = ()
+    elif type(name) is not list and type(name) is not tuple:
+        name = (name,)
+    init_db(url)
     session = Session()
     text = []
-    for path in args.csdb:
+    for path in csdb:
         text.append(readfile(path))
     cells = parse("".join(text))
     for cellname,cellinfo in cells.items():
         cell = Cell.add(session, name=cellname, desc=cellinfo['desc'])
         for address,hostname in cellinfo['hosts']:
+            log.info("importing cell %s host %s (%s) from csdb", cellname, hostname, address)
+            host = Host.add(session, cell=cell, address=address, name=hostname)
+            Node.add(session, host, name='ptserver', port=7002)
+            Node.add(session, host, name='vlserver', port=7003)
+        for address,hostname in lookup(cellname):
+            log.info("importing cell %s host %s (%s) from dns", cellname, hostname, address)
+            host = Host.add(session, cell=cell, address=address, name=hostname)
+            Node.add(session, host, name='ptserver', port=7002)
+            Node.add(session, host, name='vlserver', port=7003)
+    for cellname in name:
+        cell = Cell.add(session, name=cellname)
+        for address,hostname in lookup(cellname):
+            log.info("importing cell %s host %s (%s) from dns", cellname, hostname, address)
             host = Host.add(session, cell=cell, address=address, name=hostname)
             Node.add(session, host, name='ptserver', port=7002)
             Node.add(session, host, name='vlserver', port=7003)
@@ -72,56 +127,55 @@ def import__(args): # Trailing underscores to avoid reserved name 'import'.
 @subcommand(
     argument('--all', action='store_true', help="activate all cells"),
     argument('--cell', help="cell name"))
-def activate(args):
+def activate_(all=False, cell='', url=None, **kwargs):
     """Set activation status"""
-    init_db()
+    init_db(url)
     session = Session()
     count = 0
-    if not (args.all or args.cell):
+    if not (all or cell):
         log.error("Specify --all or --cell")
         return 1
     query = session.query(Node).filter_by(active=False)
     for node in query:
-        if args.all or node.cellname() == args.cell:
+        if all or node.cellname() == cell:
             node.active = True
             count += 1
     session.commit()
-    log.warn("activated {count} items".format(count=count))
+    log.info("activated {count} items".format(count=count))
     return 0
 
 @subcommand(
     argument('--cell', required=True, help="cell name"))
-def deactivate(args):
+def deactivate_(cell='', url=None, **kwargs):
     """Clear activation status"""
-    init_db()
+    init_db(url)
     session = Session()
     count = 0
     query = session.query(Node).filter_by(active=True)
     for node in query:
-        if node.cellname() == args.cell:
+        if node.cellname() == cell:
             node.active = False
             count += 1
     session.commit()
     log.warn("deactivated {count} items".format(count=count))
     return 0
 
-@subcommand(
-    argument("--all", action="store_true", help="list inactive endpoints too"))
-def list(args):
+@subcommand()
+def list_(url=None, **kwargs):
     """List cells"""
-    init_db()
+    init_db(url)
     session = Session()
     for cell in Cell.cells(session):
-        print "name:{cell.name} desc:'{cell.desc}'".format(cell=cell)
+        print("name:{cell.name} desc:'{cell.desc}'".format(cell=cell))
         for host in cell.hosts:
-            print "\thost:{host.name} address:{host.address}".format(host=host)
+            print("\thost:{host.name} address:{host.address}".format(host=host))
             for node in host.nodes:
-                print "\t\tnode:{node.name} port:{node.port} active:{node.active}".format(node=node)
+                print("\t\tnode:{node.name} port:{node.port} active:{node.active}".format(node=node))
     return 0
 
 @subcommand(
     argument('--nprocs', type=int, default=10, help="number of processes"))
-def scan(args):
+def scan_(nprocs=10, url=None, **kwargs):
     """Scan for versions"""
     try:
         rxdebug = sh.Command('rxdebug')
@@ -135,18 +189,17 @@ def scan(args):
         version = None
         prefix = "AFS version:"
         try:
-            output = rxdebug(address, port, '-version')
-            for line in output.stdout.splitlines():
+            for line in rxdebug(address, port, '-version'):
                 if line.startswith(prefix):
-                    version = line.replace(prefix, "").strip()
+                    version = line.strip(prefix).strip()
         except:
-            log.warn("Unable to reach endpoint %s:%d", address, port)
+            version = None
         return (node_id, version)
 
-    stage = mpipe.UnorderedStage(get_version, args.nprocs)
+    stage = mpipe.UnorderedStage(get_version, nprocs)
     pipe = mpipe.Pipeline(stage)
 
-    init_db()
+    init_db(url)
     session = Session()
     for node in session.query(Node):
         if node.active:
@@ -165,25 +218,46 @@ def scan(args):
             log.info("got version from {node.host.address}:{node.port}: {version}" \
                     .format(node=node, version=version))
             Version.add(session, node=node, version=version)
+            if not node.active:
+                node.active = True
         else:
-            log.info("could not get version from {node.host.address}:{node.port}" \
+            log.warning("could not get version from {node.host.address}:{node.port}" \
                     .format(node=node))
-            node.active = 0
+            if node.active:
+                log.info("deactivating node {node.host.address}:{node.port}" \
+                    .format(node=node))
+                node.active = False
     session.commit()
     return 0
 
-@subcommand()
-def report(args):
+@subcommand(
+    argument('-f', '--format', choices=['csv', 'html'], default='csv', help="output format"),
+    argument('-o', '--output', help="output file"))
+def report_(format='csv', output=None, url=None, **kwargs):
     """Generate version report"""
-    init_db()
+    init_db(url)
     session = Session()
     query = session.query(Cell,Host,Node,Version) \
                 .join(Host) \
                 .join(Node) \
                 .join(Version) \
                 .order_by(Cell.name, Host.address)
+    results = []
     for cell,host,node,version in query:
-        print cell.name, host.address, node.name, version.version
+        results.append({
+            'cell':cell.name,
+            'host':host.address,
+            'node':node.name,
+            'version':version.version,
+            })
+    generated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    context = {'generated':generated, 'results':results}
+    renderer = pystache.Renderer()
+    if output:
+        with open(output, 'w') as out:
+            out.write(renderer.render(template[format], context))
+    else:
+        sys.stdout.write(renderer.render(template[format], context))
     return 0
 
 def main():

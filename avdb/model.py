@@ -22,20 +22,33 @@
 """AFS version database model"""
 
 import os
-from sqlalchemy import create_engine, Column, DateTime, String, Integer, ForeignKey, or_
+from sqlalchemy import create_engine, Column, DateTime, String, Integer, ForeignKey
 from sqlalchemy.orm import relationship, sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.schema import UniqueConstraint
 from sqlalchemy.sql import func
 
+engine = None
 Base = declarative_base()
 Session = sessionmaker()
 
-def init_db():
-    URL = 'sqlite:///{}'.format(os.path.expanduser('~/avdb.db'))
-    engine = create_engine(URL)
-    Session.configure(bind=engine)
-    Base.metadata.create_all(engine)
+def mysql_create_db(admin, password, dbuser, dbpasswd, dbhost, dbname):
+    """Create the mysql database and user."""
+    db = create_engine("mysql://{admin}:{password}@{dbhost}".format(**locals()))
+    db.execute("CREATE DATABASE {dbname}".format(**locals()))
+    db.execute("CREATE USER '{dbuser}'@'localhost' IDENTIFIED BY '{dbpasswd}'".format(**locals()))
+    db.execute("CREATE USER '{dbuser}'@'%%' IDENTIFIED BY '{dbpasswd}'".format(**locals()))
+    db.execute("GRANT ALL PRIVILEGES ON {dbname}.* TO '{dbuser}'@'localhost' WITH GRANT OPTION".format(**locals()))
+    db.execute("FLUSH PRIVILEGES")
+
+def init_db(url=None):
+    global engine
+    if engine is None:
+        if url is None:
+            url = 'sqlite:///{}'.format(os.path.expanduser('~/avdb.db'))
+        engine = create_engine(url)
+        Session.configure(bind=engine)
+        Base.metadata.create_all(engine)
 
 class Cell(Base):
     __tablename__ = 'cell'
@@ -146,67 +159,3 @@ class Version(Base):
             version_ = Version(node=node, version=version, **kwargs)
             session.add(version_)
         return version_
-
-
-# Example data model usage.
-if __name__ == "__main__":
-    from pprint import pprint
-    init_db()
-    session = Session()
-
-    # example cell
-    cell = Cell.add(session, name='example.edu', desc='example cell')
-    for address in ('1.1.1.1', '2.2.2.2', '3.3.3.3'):
-        host = Host.add(session, cell, address=address)
-        for name,port in [('ptserver',7002), ('vlserver',7003)]:
-            node = Node.add(session, host, name=name, port=port)
-            for version in ('1.0.0', '1.1.0'):
-                Version.add(session, node, version=version)
-    host = Host.add(session, cell, address='0.0.0.0', name='old')
-    Node.add(session, host, name='old')
-    session.commit()
-
-    # add an inactive cell
-    cell = Cell.add(session, name='bogus.com', desc='inactive cell')
-    host = Host.add(session, cell, address='255.255.255.255', name='deadbeef')
-    Node.add(session, host, name='beefface')
-    session.commit()
-
-    print "dump tables:"
-    pprint(Cell.cells(session, all=True).all()); print ""
-    pprint(session.query(Host).all()); print ""
-    pprint(session.query(Node).all()); print ""
-    pprint(session.query(Version).all()); print ""
-
-    print "list cells and hosts"
-    for cell in Cell.cells(session, all=True):
-        pprint([cell.name, cell.hosts])
-    print ""
-
-    print "add a version"
-    cell,host,node = session.query(Cell,Host,Node) \
-            .join(Host) \
-            .join(Node) \
-            .filter(Cell.name == 'example.edu') \
-            .filter(Host.address == '2.2.2.2') \
-            .filter(Node.name == 'ptserver') \
-            .one()
-    pprint([node,node.versions])
-    Version.add(session, node=node, version='1.2.0')
-    session.commit()
-    print ""
-
-    print "list nodes"
-    for node in session.query(Node):
-        if node.active:
-            print "node"
-            pprint(node)
-            pprint(node.host)
-            pprint(node.host.cell)
-            print ""
-        else:
-            print "inactive node"
-            pprint(node)
-            pprint(node.host)
-            pprint(node.host.cell)
-            print ""
